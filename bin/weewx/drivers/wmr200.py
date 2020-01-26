@@ -48,7 +48,7 @@ import weewx.drivers
 import weeutil.weeutil
 
 DRIVER_NAME = 'WMR200'
-DRIVER_VERSION = "3.3.4"
+DRIVER_VERSION = "3.3.5"
 
 
 def loader(config_dict, engine):  # @UnusedVariable
@@ -114,6 +114,8 @@ DEBUG_CONFIG_DATA = 0
 DEBUG_WRITES = 0
 DEBUG_READS = 0
 DEBUG_CHECKSUM = 0
+# Print mapping from sensors to database fields
+DEBUG_MAPPING = 0
 
 def logmsg(dst, msg):
     """Base syslog helper"""
@@ -197,11 +199,11 @@ class UsbDevice(object):
         A specific device must have been found."""
         try:
             self.handle = self.dev.open()
-        except usb.USBError, exception:
+        except usb.USBError as exception:
             logcrt(('open_device() Unable to open USB interface.'
                     ' Reason: %s' % exception))
             raise weewx.WakeupError(exception)
-        except AttributeError, exception:
+        except AttributeError as exception:
             logcrt('open_device() Device not specified.')
             raise weewx.WakeupError(exception)
 
@@ -213,7 +215,7 @@ class UsbDevice(object):
 
         try:
             self.handle.claimInterface(self.interface)
-        except usb.USBError, exception:
+        except usb.USBError as exception:
             logcrt(('open_device() Unable to'
                     ' claim USB interface. Reason: %s' % exception))
             raise weewx.WakeupError(exception)
@@ -227,7 +229,7 @@ class UsbDevice(object):
         not be cross platform."""
         try:
             self.handle.releaseInterface()
-        except usb.USBError, exception:
+        except usb.USBError as exception:
             logcrt('close_device() Unable to'
                    ' release device interface. Reason: %s' % exception)
 
@@ -266,11 +268,11 @@ class UsbDevice(object):
                 logdbg('read_device(): %s' % buf)
             return report[1:report[0] + 1]
 
-        except IndexError, e:
+        except IndexError as e:
             # This indicates we failed an index range above.
             logerr('read_device() Failed the index rage %s: %s' % (report, e))
 
-        except usb.USBError, ex:
+        except usb.USBError as ex:
             # No data presented on the bus.  This is a normal part of
             # the process that indicates that the current live records
             # have been exhausted.  We have to send a heartbeat command
@@ -309,7 +311,7 @@ class UsbDevice(object):
                 value,                                # value
                 0x0000000,                            # index
                 _WMR200_USB_RESET_TIMEOUT)            # timeout
-        except usb.USBError, exception:
+        except usb.USBError as exception:
             msg = ('write_device() Unable to'
                    ' send USB control message %s' % exception)
             logerr(msg)
@@ -485,7 +487,7 @@ class Packet(object):
                    % len(self._pkt_data))
             raise WMR200ProtocolError(msg)
 
-        except (OverflowError, ValueError), exception:
+        except (OverflowError, ValueError) as exception:
             msg = ('Packet timestamp with bogus fields min:%d hr:%d day:%d'
                    ' m:%d y:%d %s' % (pkt_data[0], pkt_data[1],
                    pkt_data[2], pkt_data[3], pkt_data[4], exception))
@@ -1341,7 +1343,7 @@ class PollUsbDevice(threading.Thread):
             self._ok_to_read = True
             time.sleep(1)
 
-        except usb.USBError, exception:
+        except usb.USBError as exception:
             msg = ('reset_console() Unable to send USB control'
                    'message %s' % exception)
             logerr(msg)
@@ -1578,6 +1580,8 @@ class WMR200(weewx.drivers.AbstractDevice):
         DEBUG_PACKETS_PRESSURE = int(stn_dict.get('debug_packets_pressure', 0))
         global DEBUG_CHECKSUM
         DEBUG_CHECKSUM = int(stn_dict.get('debug_checksum', 0))
+        global DEBUG_MAPPING
+        DEBUG_MAPPING = int(stn_dict.get('debug_mapping', 0))
 
         if DEBUG_CONFIG_DATA:
             logdbg('Configuration setup')
@@ -1634,7 +1638,7 @@ class WMR200(weewx.drivers.AbstractDevice):
         buf = [0x01, cmd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
         try:
             self.usb_device.write_device(buf)
-        except usb.USBError, exception:
+        except usb.USBError as exception:
             msg = (('_write_cmd() Unable to send USB cmd:0x%02x control'
                     ' message' % cmd))
             logerr(msg)
@@ -1752,7 +1756,7 @@ class WMR200(weewx.drivers.AbstractDevice):
             else:
                 logdbg(('  Acknowledged control packet'
                         ' rx:%d') % PacketControl.pkt_rx)
-        except WMR200PacketParsingError, e:
+        except WMR200PacketParsingError as e:
             # Drop any bogus packets.
             logerr(self._pkt.to_string_raw('Discarding bogus packet: %s ' 
                    % e.msg))
@@ -1796,7 +1800,8 @@ class WMR200(weewx.drivers.AbstractDevice):
                        % pkt.pkt_id)
                 mapped = self._sensors_to_fields(pkt.packet_record(),
                                                  self._sensor_map)
-                yield mapped
+                if mapped:
+                    yield mapped
 
     def XXXgenArchiveRecords(self, since_ts=0):
         """A generator function to return archive packets from the wmr200.
@@ -1938,7 +1943,12 @@ class WMR200(weewx.drivers.AbstractDevice):
                 timestamp_packet_interval = timestamp_packet_current \
                         - timestamp_packet_previous
 
-                if pkt.timestamp_record() > (timestamp_packet_previous
+                if timestamp_packet_interval < 1:
+                    loginf(('genStartup() Discarding received archive record that presented out-of-order; '
+                            'current timestamp:%s; previous timestamp:%s')
+                           % (weeutil.weeutil.timestamp_to_string(timestamp_packet_current),
+                              weeutil.weeutil.timestamp_to_string(timestamp_packet_previous)))
+                elif pkt.timestamp_record() > (timestamp_packet_previous
                                              + self._archive_threshold):
                     loginf(('genStartup() Discarding received archive'
                             ' record exceeding archive interval cnt:%d'
@@ -1947,13 +1957,24 @@ class WMR200(weewx.drivers.AbstractDevice):
                               weeutil.weeutil.timestamp_to_string(
                                   pkt.timestamp_record())))
                 elif pkt.timestamp_record() > since_ts:
-                    # Calculate the rain accumulation between valid archive 
+                    # Update the timestamp delta previous value even if
+                    # we do not use this packet.  This is so the next archive
+                    # packet, if any, has the proper delta timestamp
+                    # calculation.
+                    timestamp_packet_previous = timestamp_packet_current
+
+                    # Ensure that the packet has a valid 'interval' field.
+                    packet_record_interval = int(timestamp_packet_interval / 60.0)
+                    if packet_record_interval == 0:
+                      # This packet occurred less than the minimal interval after the
+                      # initial time search space and is discarded.
+                      loginf('genStartup() Discarding received archive record'
+                             ' since interval is zero')
+                      return
+                    pkt.record_update({'interval': packet_record_interval})
+                    # Calculate the rain accumulation between valid archive
                     # packets.
                     pkt.record_update(adjust_rain(pkt, PacketArchiveData))
-                    # Ensure that the packet has a valid 'interval' field
-                    pkt.record_update({'interval': int(timestamp_packet_interval / 60.0)})
-
-                    timestamp_packet_previous = timestamp_packet_current
                     cnt += 1
                     logdbg(('genStartup() Yielding received archive'
                             ' record cnt:%d after requested timestamp'
@@ -2038,6 +2059,7 @@ class WMR200(weewx.drivers.AbstractDevice):
     @staticmethod
     def _sensors_to_fields(oldrec, sensor_map):
         # map a record with observation names to a record with db field names
+        newrec = None
         if oldrec:
             newrec = dict()
             for k in sensor_map:
@@ -2048,8 +2070,10 @@ class WMR200(weewx.drivers.AbstractDevice):
                 newrec['usUnits'] = oldrec['usUnits']
                 if 'interval' in oldrec:
                     newrec['interval'] = oldrec['interval']
-                return newrec
-        return None
+        if DEBUG_MAPPING:
+            logdbg("sensors: %s" % oldrec)
+            logdbg("fields: %s" % newrec)
+        return newrec
 
 
 class WMR200ConfEditor(weewx.drivers.AbstractConfEditor):
